@@ -697,7 +697,10 @@ local function CastBar_OnUpdate(self, elapsed)
     local _, class = UnitClass("player")
     local classColor = RAID_CLASS_COLORS and RAID_CLASS_COLORS[class] or {r=1, g=1, b=1}
     local cfg = GetConfig()
-    if cfg.colorMode == "ombre" or (cfg.colorMode == "class" and cfg.ombre) then
+    if self.overrideColor then
+        local oc = self.overrideColor
+        self.status:SetStatusBarColor(oc[1], oc[2], oc[3], oc[4] or 1)
+    elseif cfg.colorMode == "ombre" or (cfg.colorMode == "class" and cfg.ombre) then
         -- Ombre coloring (unchanged)
         local stops = {
             {p=0.10, r=1,   g=0,   b=0},      -- Red
@@ -826,6 +829,7 @@ function PlayersCastbars:OnPlayerSpellcastChannelStop(unit, castGUID, spellID)
         if not self.castBar then return end
         if UnitChannelInfo("player") then return end
         if UnitCastingInfo("player") then return end
+        self.castBar.overrideColor = nil
         self.castBar:Hide()
         self.castBar:SetScript("OnUpdate", nil)
     end)
@@ -842,6 +846,63 @@ function PlayersCastbars:OnPlayerSpellcastDelayed(unit, castGUID, spellID)
     bar.startTime = startTimeMS / 1000
     bar.endTime   = endTimeMS / 1000
 end
+
+-- =========================================================================
+-- Mass Disintegrate (Scalecommander hero talent) detection
+-- -------------------------------------------------------------------------
+-- The proc has NO dedicated cast spell ID: the channel fires with 356995
+-- (Disintegrate). The only reliable marker is the buff aura 436335
+-- ("Your next Disintegrate hits up to 3 targets"). Since the proc is consumed
+-- on cast, we snapshot the aura state at UNIT_SPELLCAST_SENT (fires before the
+-- buff is gone) and use it as a fallback.
+local DISINTEGRATE_SPELL    = 356995
+local MASS_DISINTEGRATE_ID  = 436335   -- for the localized name ("Mass Disintegrate")
+local MASS_PENDING_TIMEOUT  = 15       -- buff duration; after this the proc expires unused
+local MASS_MAX_STACKS       = 2        -- the buff stacks up to 2
+
+-- Empower-based detection (both secret- AND taint-free):
+-- The buff 436336 is "secret" in combat (unusable via aura API/combat log), and
+-- the channel fires with the same spellID 356995. BUT: Mass Disintegrate is
+-- ALWAYS granted by a completed empower, and Devastation only has the two
+-- empower spells Fire Breath & Eternity Surge. So: after every completed
+-- empower, the next Disintegrate is a Mass Disintegrate.
+--
+-- The buff STACKS to 2 and resets its duration to ~14s on every empower.
+-- Therefore we count stacks (instead of just true/false) so that two chained
+-- Mass Disintegrates in a row are also detected correctly.
+local massStacks      = 0
+local massPendingTime = 0
+
+-- Called after a completed empower: increment stack (max 2) and reset the
+-- duration (refresh, like the buff itself).
+function PlayersCastbars:MarkMassPending()
+    massStacks      = math.min(massStacks + 1, MASS_MAX_STACKS)
+    massPendingTime = GetTime()
+end
+
+-- Checks (and consumes ONE stack): every Disintegrate cast within the buff
+-- duration consumes exactly one mass stack.
+local function ConsumeMassPending()
+    if massStacks > 0 and (GetTime() - massPendingTime) < MASS_PENDING_TIMEOUT then
+        massStacks = massStacks - 1
+        return true
+    end
+    massStacks = 0   -- expired -> all stacks lapse
+    return false
+end
+
+-- Localized name of 436335 ("Mass Disintegrate").
+local function GetMassDisintegrateName()
+    if C_Spell and C_Spell.GetSpellInfo then
+        local info = C_Spell.GetSpellInfo(MASS_DISINTEGRATE_ID)
+        if info and info.name then return info.name end
+    end
+    if GetSpellInfo then
+        return (GetSpellInfo(MASS_DISINTEGRATE_ID))
+    end
+    return nil
+end
+-- =========================================================================
 
 -- Re-check for active cast after zone change or UI reload
 function PlayersCastbars:OnPlayerEnteringWorld()
@@ -886,12 +947,25 @@ function PlayersCastbars:OnPlayerSpellcastChannelStart(unit, castGUID, spellID, 
     bar.isEmpowered = false
     bar.castGUID  = castGUID
     bar.icon:SetTexture(texture)
+    local isMass = (spellID == DISINTEGRATE_SPELL) and ConsumeMassPending()
+    bar.isMassDisintegrate = isMass
+    if isMass then
+        local massName = GetMassDisintegrateName()
+        if massName then name = massName end
+    end
     bar.spellName:SetText(name)
     bar.startTime = startTimeMS / 1000
     bar.endTime   = endTimeMS / 1000
     local _, class = UnitClass("player")
     local color = RAID_CLASS_COLORS and RAID_CLASS_COLORS[class] or {r=1, g=1, b=1}
-    bar.status:SetStatusBarColor(color.r, color.g, color.b, 1)
+    if isMass then
+        -- Mass Disintegrate: highlight in green
+        bar.overrideColor = {0.5, 1, 0.5, 1}
+        bar.status:SetStatusBarColor(0.5, 1, 0.5, 1)
+    else
+        bar.overrideColor = nil
+        bar.status:SetStatusBarColor(color.r, color.g, color.b, 1)
+    end
     -- Show channel ticks if known
     local currentSpecId = PlayerUtil.GetCurrentSpecID()
     if currentSpecId then
@@ -913,7 +987,13 @@ function PlayersCastbars:OnPlayerSpellcastChannelUpdate(unit, castGUID, spellID)
     local bar = self.castBar
     bar.isChannel = true
     bar.castGUID  = castGUID
-    bar.icon:SetTexture(texture)
+    if bar.icon then
+        bar.icon:SetTexture(texture)
+    end
+    if bar.isMassDisintegrate then
+        local massName = GetMassDisintegrateName()
+        if massName then name = massName end
+    end
     bar.spellName:SetText(name)
     bar.startTime = startTimeMS / 1000
     bar.endTime   = endTimeMS / 1000
@@ -1093,19 +1173,21 @@ end
 function PlayersCastbars:OnPlayerSpellcastEmpowerUpdate(unit, castGUID, spellID)
     if unit ~= "player" then return end -- Bug #6 fix: filter non-player units
     if not self.castBar then return end
-        -- Do not compare castGUID; protected value can cause errors
+    -- Do not compare castGUID; protected value can cause errors
     local bar = self.castBar
-    local name, _, texture, startTimeMS, endTimeMS = UnitCastingInfo("player")
+    local name, _, texture, startTimeMS, endTimeMS = UnitChannelInfo("player")
+    if not name or not startTimeMS or not endTimeMS then
+        name, _, texture, startTimeMS, endTimeMS = UnitCastingInfo("player")
+    end
     if not name or not startTimeMS or not endTimeMS then return end
     bar.isChannel = false
     bar.castGUID  = castGUID
-    bar.icon:SetTexture(texture)
+    if bar.icon then
+        bar.icon:SetTexture(texture)
+    end
     bar.spellName:SetText(name)
     bar.startTime = startTimeMS / 1000
     bar.endTime   = endTimeMS / 1000
-    local _, class = UnitClass("player")
-    local color = RAID_CLASS_COLORS and RAID_CLASS_COLORS[class] or {r=1, g=1, b=1}
-        -- Do not override the gradient texture with a solid color
 end
 
 function PlayersCastbars:OnPlayerSpellcastEmpowerStop(unit, castGUID, spellID)
@@ -1114,7 +1196,9 @@ function PlayersCastbars:OnPlayerSpellcastEmpowerStop(unit, castGUID, spellID)
     if castGUID and self.castBar.castGUID and castGUID ~= self.castBar.castGUID then return end
     local name, _, texture, startTimeMS, endTimeMS = UnitCastingInfo("player")
     if name and startTimeMS and endTimeMS then
-        self.castBar.icon:SetTexture(texture)
+        if self.castBar.icon and texture then
+            self.castBar.icon:SetTexture(texture)
+        end
         self.castBar.spellName:SetText(name)
         self.castBar.startTime = startTimeMS / 1000
         self.castBar.endTime = endTimeMS / 1000
@@ -1277,7 +1361,7 @@ eventSetupFrame:SetScript("OnEvent", function()
         f:RegisterEvent("UNIT_SPELLCAST_NOT_INTERRUPTIBLE")
         f:RegisterEvent("UNIT_SPELLCAST_DELAYED")
         f:RegisterEvent("PLAYER_ENTERING_WORLD")
-        f:SetScript("OnEvent", function(_, event, unit, castGUID, spellID)
+        f:SetScript("OnEvent", function(_, event, unit, castGUID, spellID, arg4)
             if event == "UNIT_SPELLCAST_START" then PlayersCastbars:OnPlayerSpellcastStart(unit, castGUID, spellID)
             elseif event == "UNIT_SPELLCAST_STOP" then PlayersCastbars:OnPlayerSpellcastStop(unit, castGUID, spellID)
             elseif event == "UNIT_SPELLCAST_CHANNEL_START" then PlayersCastbars:OnPlayerSpellcastChannelStart(unit, castGUID, spellID)
@@ -1285,7 +1369,13 @@ eventSetupFrame:SetScript("OnEvent", function()
             elseif event == "UNIT_SPELLCAST_CHANNEL_STOP" then PlayersCastbars:OnPlayerSpellcastChannelStop(unit, castGUID, spellID)
             elseif event == "UNIT_SPELLCAST_EMPOWER_START" then PlayersCastbars:OnPlayerSpellcastEmpowerStart(unit, castGUID, spellID)
             elseif event == "UNIT_SPELLCAST_EMPOWER_UPDATE" then PlayersCastbars:OnPlayerSpellcastEmpowerUpdate(unit, castGUID, spellID)
-            elseif event == "UNIT_SPELLCAST_EMPOWER_STOP" then PlayersCastbars:OnPlayerSpellcastEmpowerStop(unit, castGUID, spellID)
+            elseif event == "UNIT_SPELLCAST_EMPOWER_STOP" then
+                -- arg4 == complete (if provided by the event): only a fully
+                -- released empower grants Mass Disintegrate. If the event
+                -- provides no complete flag (arg4 == nil), mark anyway --
+                -- only skip on an explicit cancel (arg4 == false).
+                if unit == "player" and arg4 ~= false then PlayersCastbars:MarkMassPending() end
+                PlayersCastbars:OnPlayerSpellcastEmpowerStop(unit, castGUID, spellID)
             elseif event == "UNIT_SPELLCAST_DELAYED" then PlayersCastbars:OnPlayerSpellcastDelayed(unit, castGUID, spellID)
             elseif event == "PLAYER_ENTERING_WORLD" then PlayersCastbars:OnPlayerEnteringWorld()
             end
