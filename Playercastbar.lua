@@ -945,9 +945,25 @@ function PlayersCastbars:OnPlayerSpellcastChannelStart(unit, castGUID, spellID, 
     end
     bar.isChannel = true
     bar.isEmpowered = false
-    bar.castGUID  = castGUID
     bar.icon:SetTexture(texture)
-    local isMass = (spellID == DISINTEGRATE_SPELL) and ConsumeMassPending()
+    -- Off-GCD instants that don't break a channel (e.g. Hover, spellID 358267)
+    -- can re-fire UNIT_SPELLCAST_CHANNEL_START for the SAME ongoing Disintegrate
+    -- channel. In that case the Mass Disintegrate stack was already consumed by
+    -- the original start, so re-consuming here would wrongly revert the bar to a
+    -- plain Disintegrate. Detect the re-fire via the unchanged castGUID and keep
+    -- the existing mass state instead of consuming another stack.
+    local isMass
+    if spellID == DISINTEGRATE_SPELL then
+        local sameChannel = castGUID and bar.castGUID and castGUID == bar.castGUID
+        if sameChannel and bar.isMassDisintegrate then
+            isMass = true
+        else
+            isMass = ConsumeMassPending()
+        end
+    else
+        isMass = false
+    end
+    bar.castGUID  = castGUID
     bar.isMassDisintegrate = isMass
     if isMass then
         local massName = GetMassDisintegrateName()
