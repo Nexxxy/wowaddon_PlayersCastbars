@@ -946,15 +946,19 @@ function PlayersCastbars:OnPlayerSpellcastChannelStart(unit, castGUID, spellID, 
     bar.isChannel = true
     bar.isEmpowered = false
     bar.icon:SetTexture(texture)
+    local startSec = startTimeMS / 1000
     -- Off-GCD instants that don't break a channel (e.g. Hover, spellID 358267)
     -- can re-fire UNIT_SPELLCAST_CHANNEL_START for the SAME ongoing Disintegrate
-    -- channel. In that case the Mass Disintegrate stack was already consumed by
-    -- the original start, so re-consuming here would wrongly revert the bar to a
-    -- plain Disintegrate. Detect the re-fire via the unchanged castGUID and keep
-    -- the existing mass state instead of consuming another stack.
+    -- channel. The Mass Disintegrate stack was already consumed by the original
+    -- start, so re-consuming here would wrongly revert the bar to a plain
+    -- Disintegrate. The event's castGUID is nil for channels, so we can't use it.
+    -- Instead detect the re-fire via the channel start time: a re-fire keeps
+    -- nearly the same start (observed drift up to ~0.1s), whereas a genuine
+    -- chained cast starts a full channel length (~2s) later. Use a 0.5s window.
     local isMass
     if spellID == DISINTEGRATE_SPELL then
-        local sameChannel = castGUID and bar.castGUID and castGUID == bar.castGUID
+        local sameChannel = bar.startTime
+            and math.abs(startSec - bar.startTime) < 0.5
         if sameChannel and bar.isMassDisintegrate then
             isMass = true
         else

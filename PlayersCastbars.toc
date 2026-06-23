@@ -30,6 +30,7 @@ Libs/LibSharedMedia-3.0/lib.xml
 # Load AceGUI-3.0-SharedMediaWidgets XML (for LSM30_Statusbar)
 PlayersCastbars_AceGUISharedMediaWidgets.xml
 
+Debug.lua
 Playercastbar.lua
 Target.lua
 focusp.lua
